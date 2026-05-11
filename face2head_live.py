@@ -29,14 +29,26 @@ PTS_3D_AUX = np.array([
     [0.0,  0.0,  2.3],   # back_head
 ], dtype=np.float64)
 
+# ### 1) твои точки коробки под головной убор
+PTS_3D_HAT = np.array([
+    [-1.0,  1.9,  -0.2],
+    [-1.0,  1.9,   2.4],
+    [-1.0,  0.4,  -0.2],
+    [-1.0,  0.4,   2.4],
+    [ 1.0,  1.9,  -0.2],
+    [ 1.0,  1.9,   2.4],
+    [ 1.0,  0.4,  -0.2],
+    [ 1.0,  0.4,   2.4],
+], dtype=np.float64)
+
 HEAD_KPT_IDX = [0, 1, 2, 3, 4]  # nose, l_eye, r_eye, l_ear, r_ear
 
 # COCO colors BGR
-BLUE = (255, 120, 0)
-RED = (0, 0, 255)
-GREEN = (0, 220, 0)
+BLUE   = (255, 120, 0)
+RED    = (0, 0, 255)
+GREEN  = (0, 220, 0)
 YELLOW = (0, 220, 220)
-WHITE = (255, 255, 255)
+WHITE  = (255, 255, 255)
 
 
 def get_camera_matrix(w: int, h: int) -> np.ndarray:
@@ -82,17 +94,23 @@ def head_pose_from_5pts(pts_2d_xy: np.ndarray, K: np.ndarray, dist: np.ndarray):
     R, _ = cv2.Rodrigues(rvec)
     t = tvec.reshape(3)
 
-    pts_3d_cam = PTS_3D @ R.T + t
-    pts_3d_aux_cam = PTS_3D_AUX @ R.T + t
+    pts_3d_cam      = PTS_3D      @ R.T + t
+    pts_3d_aux_cam  = PTS_3D_AUX  @ R.T + t
+    pts_3d_hat_cam  = PTS_3D_HAT  @ R.T + t   # в камере, если понадобится
 
     pts_2d_aux = project_points(PTS_3D_AUX, rvec, tvec, K, dist)
+    pts_2d_hat = project_points(PTS_3D_HAT, rvec, tvec, K, dist)  # ### 2) 2D-точки коробки
 
     face_vec = pts_3d_aux_cam[4] - pts_3d_cam[0]  # back_head -> nose
     norm = np.linalg.norm(face_vec)
     if norm > 1e-9:
         face_vec = face_vec / norm
 
-    face_angle_deg = np.degrees(np.arccos(np.clip(face_vec @ np.array([0.0, 0.0, 1.0]), -1.0, 1.0)))
+    face_angle_deg = np.degrees(
+        np.arccos(
+            np.clip(face_vec @ np.array([0.0, 0.0, 1.0]), -1.0, 1.0)
+        )
+    )
 
     return {
         "rvec": rvec,
@@ -100,7 +118,9 @@ def head_pose_from_5pts(pts_2d_xy: np.ndarray, K: np.ndarray, dist: np.ndarray):
         "R": R,
         "pts_3d_cam": pts_3d_cam,
         "pts_3d_aux_cam": pts_3d_aux_cam,
+        "pts_3d_hat_cam": pts_3d_hat_cam,
         "pts_2d_aux": pts_2d_aux,
+        "pts_2d_hat": pts_2d_hat,          # ← добавили
         "face_vec": face_vec,
         "face_angle_deg": face_angle_deg,
     }
@@ -183,23 +203,44 @@ def main():
             pose = head_pose_from_5pts(pts_2d, K, dist)
 
             if pose is not None:
-                aux2d = pose["pts_2d_aux"]
-                aux3d = pose["pts_3d_aux_cam"]
+                aux2d  = pose["pts_2d_aux"]
+                aux3d  = pose["pts_3d_aux_cam"]
+                hat2d  = pose["pts_2d_hat"]      # ### 3) 2D-точки коробки
                 face_vec = pose["face_vec"]
                 face_angle_deg = pose["face_angle_deg"]
 
-                # Рисуем достроенные точки
+                # Рисуем достроенные aux точки (красные)
                 for i, pt in enumerate(aux2d):
                     draw_point(vis, pt, RED, AUX_NAMES[i], r=4)
 
-                # Линия back_head -> nose
+                # Рисуем коробку (зелёные точки + рёбра)
+                # Индексы твоих pts_3d_hat: 0..7
+                # Примем порядок:
+                # 0-1-3-2 и 4-5-7-6 — "прямоугольники", плюс боковые рёбра
+                hat_edges = [
+                    (0, 1), (1, 3), (3, 2), (2, 0),   # левый "столб"
+                    (4, 5), (5, 7), (7, 6), (6, 4),   # правый "столб"
+                    (0, 4), (1, 5), (2, 6), (3, 7),   # связи между левым и правым
+                ]
+
+                # точки
+                for pt in hat2d:
+                    draw_point(vis, pt, GREEN, None, r=3)
+
+                # рёбра
+                for i, j in hat_edges:
+                    p1 = tuple(np.int32(hat2d[i]))
+                    p2 = tuple(np.int32(hat2d[j]))
+                    cv2.line(vis, p1, p2, GREEN, 2, lineType=cv2.LINE_AA)
+
+                # Линия back_head -> nose (как было)
                 nose_2d = pts_2d[0]
                 back_2d = aux2d[4]
                 cv2.line(
                     vis,
                     tuple(np.int32(back_2d)),
                     tuple(np.int32(nose_2d)),
-                    GREEN,
+                    (0, 165, 255),
                     2,
                     lineType=cv2.LINE_AA
                 )
@@ -230,7 +271,7 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2, cv2.LINE_AA
             )
 
-        cv2.imshow("Head pose + aux points", vis)
+        cv2.imshow("Head pose + aux + hat box", vis)
         key = cv2.waitKey(1) & 0xFF
 
         if key in (27, ord("q")):
