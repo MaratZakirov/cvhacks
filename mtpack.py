@@ -47,38 +47,45 @@ class CSVImageDataset(Dataset):
         y = int(self.labels[idx])
         return x, y
 
-USE_DERF = True
 
-if USE_DERF:
-    class nLiniarity(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.beta = nn.Parameter(torch.ones(dim))
-            self.s = nn.Parameter(torch.zeros(dim))
-
-        def forward(self, x):
-            return torch.erf(self.beta * x + self.s)
-else:
-    class nLiniarity(nn.Module):
-        def __init__(self, dim):
-            super().__init__()
-            self.bn = nn.BatchNorm1d(dim)
-            self.relu = nn.ReLU(inplace=False)
-
-        def forward(self, x):
-            return self.relu(self.bn(x))
-
-class SimpleDerfNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(SimpleDerfNet, self).__init__()
-        self.layers = nn.Sequential(nn.Linear(28*28, 32),
-                                    nLiniarity(32),
-                                    nn.Linear(32, 16),
-                                    nLiniarity(16),
-                                    nn.Linear(16, num_classes))
+class Derf(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1, dim, 1, 1) * 0.4)
+        self.beta = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.s = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
-        return self.layers(x.reshape(-1, 28*28))
+        return self.alpha * torch.erf(self.beta * x + self.s)
+
+
+class DSBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size=5, stride=stride, padding=2, groups=in_ch)
+        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.derf = Derf(out_ch)
+
+    def forward(self, x):
+        return self.derf(self.pw(self.dw(x)))
+
+
+class SimpleDerfNet(nn.Module):
+    def __init__(self, num_classes=9):
+        super(SimpleDerfNet, self).__init__()
+        self.layer1 = DSBlock(1, 4, stride=1)
+        self.layer2 = DSBlock(4, 8, stride=2)
+        self.layer3 = DSBlock(8, 16, stride=2)
+        self.layer4 = DSBlock(16, 1, stride=1)
+        self.fc = nn.Linear(49, num_classes)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x).view(x.size(0), -1)
+        return self.fc(x)
+
 
 def pick_device():
     if torch.cuda.is_available():
@@ -127,8 +134,8 @@ def eval_loader(model, loader, device):
 
 class HybridOptimizer:
     def __init__(self, model, lr=0.001):
-        muon_params = [p for p in model.parameters() if p.ndim >= 2]
-        adamw_params = [p for p in model.parameters() if p.ndim < 2]
+        muon_params = [p for p in model.parameters() if p.ndim == 2]
+        adamw_params = [p for p in model.parameters() if p.ndim != 2]
 
         self.muon = torch.optim.Muon(muon_params, lr=lr, momentum=0.95)
         self.adamw = torch.optim.AdamW(adamw_params, lr=lr / 10, weight_decay=0.01)
@@ -171,6 +178,7 @@ def main():
     val_cls_loader = DataLoader(val_cls_ds, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     model = SimpleDerfNet(num_classes=10).to(device)
+    print(f'Model has: {sum(p.numel() for p in model.parameters())} parameters')
     optimizer = HybridOptimizer(model)
 
     for epoch in range(args.epochs):
