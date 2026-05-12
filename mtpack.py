@@ -11,6 +11,7 @@ import numpy as np
 from kaggle.api.kaggle_api_extended import KaggleApi
 from torch.optim import AdamW, Muon
 import matplotlib.pyplot as plt
+import time
 
 def download_kaggle_mnist(target_dir: Path):
     if not target_dir.exists():
@@ -94,7 +95,7 @@ def pick_device():
         return torch.device('mps')
     return torch.device('cpu')
 
-def train_one_epoch(model, loader, optim, device):
+def train_one_epoch(model, loader, optim, device, use_bf16=False):
     model.train()
     total_loss = 0.0
     correct = 0
@@ -103,8 +104,11 @@ def train_one_epoch(model, loader, optim, device):
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optim.zero_grad()
-        logits = model(x)
-        loss = loss_func(logits, y)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            logits = model(x)
+            loss = loss_func(logits, y)
+
         loss.backward()
         optim.step()
 
@@ -115,7 +119,7 @@ def train_one_epoch(model, loader, optim, device):
 
 
 @torch.no_grad()
-def eval_loader(model, loader, device):
+def eval_loader(model, loader, device, use_bf16=False):
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -123,8 +127,10 @@ def eval_loader(model, loader, device):
     loss_func = nn.CrossEntropyLoss(reduction='mean')
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = loss_func(logits, y)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
+            logits = model(x)
+            loss = loss_func(logits, y)
 
         total_loss += loss.item()
         correct += ((logits.argmax(1) == y) + 0.).mean().item()
@@ -156,9 +162,12 @@ def main():
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--data-dir', type=str, default='/Volumes/HP/proj/mnist_data/data')
     parser.add_argument('--out-dir', type=str, default='/Volumes/HP/proj/mnist_data/results')
+    parser.add_argument('--bf16', action='store_true')
     args = parser.parse_args()
 
     device = pick_device()
+
+    use_bf16 = args.bf16 and (device.type == 'cuda' or device.type == 'mps')
 
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
@@ -174,17 +183,21 @@ def main():
     num_workers = 0 if device.type == 'mps' else 2
     pin_memory = device.type == 'cuda'
 
-    train_loader   = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-    val_cls_loader = DataLoader(val_cls_ds, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    train_loader   = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)#,
+                                #persistent_workers=True)
+    val_cls_loader = DataLoader(val_cls_ds, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)#,
+                                #persistent_workers=True)
 
     model = SimpleDerfNet(num_classes=10).to(device)
     print(f'Model has: {sum(p.numel() for p in model.parameters())} parameters')
     optimizer = HybridOptimizer(model)
 
     for epoch in range(args.epochs):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, device)
-        va_loss, va_acc = eval_loader(model, val_cls_loader, device)
-        print(f'Epoch: {epoch}, loss_tr: {tr_loss:0.3f}, tr_acc: {tr_acc:0.3f}, va_loss {va_loss:0.3f}, va_acc {va_acc:0.3f}')
+        start_epoch = time.time()
+        tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, device, use_bf16)
+        va_loss, va_acc = eval_loader(model, val_cls_loader, device, use_bf16)
+        end_epoch = time.time()
+        print(f'Epoch: {epoch}, loss_tr: {tr_loss:0.3f}, tr_acc: {tr_acc:0.3f}, va_loss {va_loss:0.3f}, va_acc {va_acc:0.3f} took {end_epoch - start_epoch:.3f} seconds')
 
 if __name__ == '__main__':
     main()
