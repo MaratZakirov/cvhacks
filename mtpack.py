@@ -27,7 +27,7 @@ def download_kaggle_mnist(target_dir: Path):
     return train_csv, test_csv
 
 class CSVImageDataset(Dataset):
-    def __init__(self, csv_path, keep_digits=None, only_digits=None):
+    def __init__(self, csv_path, device, keep_digits=None, only_digits=None):
         df = pd.read_csv(csv_path)
         labels = df.iloc[:, 0].to_numpy()
         images = df.iloc[:, 1:].to_numpy(dtype=np.uint8).reshape(-1, 28, 28)
@@ -36,17 +36,17 @@ class CSVImageDataset(Dataset):
             mask &= np.isin(labels, keep_digits)
         if only_digits is not None:
             mask &= np.isin(labels, only_digits)
-        self.labels = labels[mask]
-        self.images = images[mask]
-        self.tf = transforms.ToTensor()
+
+        # Внутри CSVImageDataset.__init__
+        self.images = torch.from_numpy(images[mask]).float().to(device) / 255.0  # Сразу в тензор [N, 28, 28]
+        self.images = self.images.unsqueeze(1)  # Добавляем канал -> [N, 1, 28, 28]
+        self.labels = torch.tensor(labels[mask], dtype=torch.long).to(device)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        x = self.tf(Image.fromarray(self.images[idx], mode='L'))
-        y = int(self.labels[idx])
-        return x, y
+        return self.images[idx], self.labels[idx]
 
 
 class Derf(nn.Module):
@@ -154,11 +154,30 @@ class HybridOptimizer:
         self.muon.step()
         self.adamw.step()
 
+class FastLoader:
+    def __init__(self, images, labels, batch_size, shuffle=True):
+        self.images = images
+        self.labels = labels
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = images.shape[0]
+
+    def __iter__(self):
+        if self.shuffle:
+            indices = torch.randperm(self.n, device=self.images.device)
+            self.images = self.images[indices]
+            self.labels = self.labels[indices]
+
+        for i in range(0, self.n, self.batch_size):
+            yield self.images[i:i + self.batch_size], self.labels[i:i + self.batch_size]
+
+    def __len__(self):
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--data-dir', type=str, default='/Volumes/HP/proj/mnist_data/data')
     parser.add_argument('--out-dir', type=str, default='/Volumes/HP/proj/mnist_data/results')
@@ -177,16 +196,11 @@ def main():
 
     train_digits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-    train_ds = CSVImageDataset(train_csv, keep_digits=train_digits)
-    val_cls_ds = CSVImageDataset(test_csv, keep_digits=train_digits)
+    train_ds   = CSVImageDataset(train_csv, device, keep_digits=train_digits)
+    val_cls_ds = CSVImageDataset(test_csv, device, keep_digits=train_digits)
 
-    num_workers = 0 if device.type == 'mps' else 2
-    pin_memory = device.type == 'cuda'
-
-    train_loader   = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)#,
-                                #persistent_workers=True)
-    val_cls_loader = DataLoader(val_cls_ds, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)#,
-                                #persistent_workers=True)
+    train_loader   = FastLoader(train_ds.images, train_ds.labels, batch_size=64, shuffle=True)
+    val_cls_loader = FastLoader(val_cls_ds.images, val_cls_ds.labels, batch_size=64, shuffle=False)
 
     model = SimpleDerfNet(num_classes=10).to(device)
     print(f'Model has: {sum(p.numel() for p in model.parameters())} parameters')
