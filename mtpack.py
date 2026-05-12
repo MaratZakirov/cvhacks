@@ -10,12 +10,15 @@ import pandas as pd
 import numpy as np
 from kaggle.api.kaggle_api_extended import KaggleApi
 from torch.optim import AdamW, Muon
+import matplotlib.pyplot as plt
 
 def download_kaggle_mnist(target_dir: Path):
-    target_dir.mkdir(parents=True, exist_ok=True)
-    api = KaggleApi()
-    api.authenticate()
-    api.dataset_download_files('oddrationale/mnist-in-csv', path=str(target_dir), unzip=True)
+    if not target_dir.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+        api = KaggleApi()
+        api.authenticate()
+        api.dataset_download_files('oddrationale/mnist-in-csv', path=str(target_dir), unzip=True)
+
     train_csv = target_dir / 'mnist_train.csv'
     test_csv = target_dir / 'mnist_test.csv'
     if not train_csv.exists() or not test_csv.exists():
@@ -44,23 +47,35 @@ class CSVImageDataset(Dataset):
         y = int(self.labels[idx])
         return x, y
 
-class nLiniarity(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(dim)
-        self.relu = nn.ReLU(inplace=False)
+USE_DERF = True
 
-    def forward(self, x):
-        return self.relu(self.bn(x))
+if USE_DERF:
+    class nLiniarity(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.beta = nn.Parameter(torch.ones(dim))
+            self.s = nn.Parameter(torch.zeros(dim))
+
+        def forward(self, x):
+            return torch.erf(self.beta * x + self.s)
+else:
+    class nLiniarity(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.bn = nn.BatchNorm1d(dim)
+            self.relu = nn.ReLU(inplace=False)
+
+        def forward(self, x):
+            return self.relu(self.bn(x))
 
 class SimpleDerfNet(nn.Module):
     def __init__(self, num_classes=10):
-        super().__init__()
-        self.layers = nn.Sequential(nn.Linear(28*28, 28),
-                                    nLiniarity(28),
-                                    nn.Linear(28, 20),
-                                    nLiniarity(20),
-                                    nn.Linear(20, num_classes))
+        super(SimpleDerfNet, self).__init__()
+        self.layers = nn.Sequential(nn.Linear(28*28, 32),
+                                    nLiniarity(32),
+                                    nn.Linear(32, 16),
+                                    nLiniarity(16),
+                                    nn.Linear(16, num_classes))
 
     def forward(self, x):
         return self.layers(x.reshape(-1, 28*28))
@@ -75,45 +90,43 @@ def pick_device():
 def train_one_epoch(model, loader, optim, device):
     model.train()
     total_loss = 0.0
-    total = 0
     correct = 0
+
+    loss_func = nn.CrossEntropyLoss(reduction='mean')
     for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        optim.zero_grad()
+        x, y = x.to(device), y.to(device)
         logits = model(x)
-        loss = F.cross_entropy(logits, y)
+        loss = loss_func(logits, y)
         loss.backward()
         optim.step()
 
-        #print('L:', loss.item())
+        total_loss += loss.item()
+        correct += ((logits.argmax(1) == y) + 0.).mean().item()
 
-        total_loss += loss.item() * x.size(0)
-        total += x.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
-
-    return total_loss / total, correct / total
+    return total_loss / len(loader), correct / len(loader)
 
 
 @torch.no_grad()
 def eval_loader(model, loader, device):
     model.eval()
     total_loss = 0.0
-    total = 0
     correct = 0
-    for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
-        total_loss += loss.item() * x.size(0)
-        total += x.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
 
-    return total_loss / total, correct / total
+    loss_func = nn.CrossEntropyLoss(reduction='mean')
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        loss = loss_func(logits, y)
+
+        total_loss += loss.item()
+        correct += ((logits.argmax(1) == y) + 0.).mean().item()
+
+    return total_loss / len(loader), correct / len(loader)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--data-dir', type=str, default='/Volumes/HP/proj/mnist_data/data')
     parser.add_argument('--out-dir', type=str, default='/Volumes/HP/proj/mnist_data/results')
@@ -127,7 +140,7 @@ def main():
 
     train_csv, test_csv = download_kaggle_mnist(data_dir)
 
-    train_digits = [0, 2, 3, 4, 5, 6, 7, 8, 9]
+    train_digits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
     train_ds = CSVImageDataset(train_csv, keep_digits=train_digits)
     val_cls_ds = CSVImageDataset(test_csv, keep_digits=train_digits)
