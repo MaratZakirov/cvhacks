@@ -95,6 +95,7 @@ def train_one_epoch(model, loader, optim, device):
     loss_func = nn.CrossEntropyLoss(reduction='mean')
     for x, y in loader:
         x, y = x.to(device), y.to(device)
+        optim.zero_grad()
         logits = model(x)
         loss = loss_func(logits, y)
         loss.backward()
@@ -122,6 +123,24 @@ def eval_loader(model, loader, device):
         correct += ((logits.argmax(1) == y) + 0.).mean().item()
 
     return total_loss / len(loader), correct / len(loader)
+
+
+class HybridOptimizer:
+    def __init__(self, model, lr=0.001):
+        muon_params = [p for p in model.parameters() if p.ndim >= 2]
+        adamw_params = [p for p in model.parameters() if p.ndim < 2]
+
+        self.muon = torch.optim.Muon(muon_params, lr=lr, momentum=0.95)
+        self.adamw = torch.optim.AdamW(adamw_params, lr=lr / 10, weight_decay=0.01)
+
+    def zero_grad(self):
+        self.muon.zero_grad()
+        self.adamw.zero_grad()
+
+    def step(self):
+        self.muon.step()
+        self.adamw.step()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -152,8 +171,7 @@ def main():
     val_cls_loader = DataLoader(val_cls_ds, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     model = SimpleDerfNet(num_classes=10).to(device)
-    optimizer = AdamW(model.parameters(), lr=0.0001)
-    # Muon(model.parameters(), lr=0.001) #
+    optimizer = HybridOptimizer(model)
 
     for epoch in range(args.epochs):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, device)
