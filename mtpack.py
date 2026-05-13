@@ -11,6 +11,8 @@ import numpy as np
 from torch.optim import AdamW, Muon
 import matplotlib.pyplot as plt
 import time
+import contextlib
+
 
 def download_kaggle_mnist(target_dir: Path):
     if not target_dir.exists():
@@ -194,9 +196,34 @@ class FastLoader:
     def __len__(self):
         return (self.n + self.batch_size - 1) // self.batch_size
 
+
+def collect_energy(model, loader, temperature, device, use_bf16):
+    model.eval()
+    energy_scores = []
+
+    # Определяем контекст автокаста
+    amp_dtype = torch.bfloat16 if device.type == 'cuda' else torch.float16
+    ctx = torch.amp.autocast(device_type=device.type, dtype=amp_dtype) if use_bf16 else contextlib.nullcontext()
+
+    with torch.no_grad():
+        for x, _ in loader:
+            with ctx:
+                logits = model(x)  # [B, 10]
+                if use_bf16:
+                    logits = logits.float()
+
+            # Формула свободной энергии Гельмгольца (Weitang Liu et al.)
+            # E(x) = -T * logsumexp(logits / T)
+            scaled_logits = logits / temperature
+            energy = -temperature * torch.logsumexp(scaled_logits, dim=1)
+            energy_scores.append(energy.cpu())
+
+    return torch.cat(energy_scores).numpy()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--data-dir', type=str, default='/Volumes/HP/proj/mnist_data/data')
@@ -214,7 +241,7 @@ def main():
 
     train_csv, test_csv = download_kaggle_mnist(data_dir)
 
-    train_digits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    train_digits = [0, 2, 3, 4, 5, 6, 7, 8, 9]
 
     train_ds   = CSVImageDataset(train_csv, device, keep_digits=train_digits)
     val_cls_ds = CSVImageDataset(test_csv, device, keep_digits=train_digits)
@@ -232,6 +259,46 @@ def main():
         va_loss, va_acc = eval_loader(model, val_cls_loader, device, use_bf16)
         end_epoch = time.time()
         print(f'Epoch: {epoch}, loss_tr: {tr_loss:0.3f}, tr_acc: {tr_acc:0.3f}, va_loss {va_loss:0.3f}, va_acc {va_acc:0.3f} took {end_epoch - start_epoch:.3f} seconds')
+
+    # === КОД ДЛЯ OOD ДЕТЕКЦИИ ПОСЛЕ ЦИКЛА ОБУЧЕНИЯ ===
+    print("\nStarting Energy-based OOD detection analysis...")
+
+    # 1. Загружаем датасеты, содержащие ТОЛЬКО 7 и ТОЛЬКО 1
+    # Предполагается, что CSVImageDataset принимает оригинальные метки Kaggle (0-9)
+    ds_id_7 = CSVImageDataset(test_csv, device, keep_digits=[7])
+    ds_ood_1 = CSVImageDataset(test_csv, device, keep_digits=[1])
+
+    loader_id_7 = FastLoader(ds_id_7.images, ds_id_7.labels, batch_size=args.batch_size, shuffle=False)
+    loader_ood_1 = FastLoader(ds_ood_1.images, ds_ood_1.labels, batch_size=args.batch_size, shuffle=False)
+
+    # 2. Собираем значения энергии для ID (7) и OOD (1)
+    T = args.temperature
+    energy_id = collect_energy(model, loader_id_7, T, device, use_bf16)
+    energy_ood = collect_energy(model, loader_ood_1, T, device, use_bf16)
+
+    # 3. Построение и сохранение графиков
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 6))
+
+    # Строим гистограммы плотности распределения (density=True)
+    plt.hist(energy_id, bins=50, alpha=0.6, label='ID (Digit 7)', color='blue', edgecolor='k', density=True)
+    plt.hist(energy_ood, bins=50, alpha=0.6, label='OOD (Digit 1)', color='red', edgecolor='k', density=True)
+
+    plt.title(f'Helmholtz Energy Distribution for ID vs OOD (T={T})')
+    plt.xlabel('Energy Value')
+    plt.ylabel('Density')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend(loc='upper right')
+
+    # Сохраняем результат в out_dir
+    plot_path = out_dir / 'energy_ood_histogram.png'
+    plt.savefig(plot_path, bbox_inches='tight', dpi=150)
+    plt.close()
+
+    print(f"OOD Analysis finished. Plot saved to: {plot_path}")
+    print(f"Mean Energy ID (7): {energy_id.mean():.4f}")
+    print(f"Mean Energy OOD (1): {energy_ood.mean():.4f}")
 
 if __name__ == '__main__':
     main()
