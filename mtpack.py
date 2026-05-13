@@ -8,13 +8,13 @@ from torchvision import transforms
 from PIL import Image
 import pandas as pd
 import numpy as np
-from kaggle.api.kaggle_api_extended import KaggleApi
 from torch.optim import AdamW, Muon
 import matplotlib.pyplot as plt
 import time
 
 def download_kaggle_mnist(target_dir: Path):
     if not target_dir.exists():
+        from kaggle.api.kaggle_api_extended import KaggleApi
         target_dir.mkdir(parents=True, exist_ok=True)
         api = KaggleApi()
         api.authenticate()
@@ -52,24 +52,42 @@ class CSVImageDataset(Dataset):
 class Derf(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.alpha = nn.Parameter(torch.ones(1, dim, 1, 1) * 0.4)
-        self.beta = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.s = nn.Parameter(torch.ones(1, dim, 1, 1))
+        # Изменяем размерность параметров под формат [B, N, C]
+        # Последняя размерность — каналы (dim)
+        self.alpha = nn.Parameter(torch.ones(1, 1, dim) * 0.4)
+        self.beta = nn.Parameter(torch.ones(1, 1, dim))
+        self.s = nn.Parameter(torch.ones(1, 1, dim))
 
     def forward(self, x):
         return self.alpha * torch.erf(self.beta * x + self.s)
 
-
 class DSBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()
+        # Depthwise свертка остается без изменений
         self.dw = nn.Conv2d(in_ch, in_ch, kernel_size=5, stride=stride, padding=2, groups=in_ch)
-        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+
+        # Вместо Conv2d 1x1 используем Linear. Веса будут иметь честную 2D-форму.
+        self.pw = nn.Linear(in_ch, out_ch)
         self.derf = Derf(out_ch)
 
     def forward(self, x):
-        return self.derf(self.pw(self.dw(x)))
+        # 1. Прогоняем через пространственную depthwise свертку
+        x = self.dw(x)  # [B, in_ch, H, W]
 
+        # 2. Перекладываем оси для линейного слоя: [B, in_ch, H, W] -> [B, H, W, in_ch]
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()  # [B, H, W, in_ch]
+        x = x.view(B, H * W, C)  # Схлопываем пространство: [B, H*W, in_ch]
+
+        # 3. Применяем Pointwise (Linear) и нелинейность Derf
+        x = self.pw(x)  # [B, H*W, out_ch]
+        x = self.derf(x)
+
+        # 4. Возвращаем исходную структуру [B, out_ch, H, W] для следующего слоя
+        x = x.view(B, H, W, -1)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
 
 class SimpleDerfNet(nn.Module):
     def __init__(self, num_classes=9):
@@ -95,6 +113,7 @@ def pick_device():
         return torch.device('mps')
     return torch.device('cpu')
 
+
 def train_one_epoch(model, loader, optim, device, use_bf16=False):
     model.train()
     total_loss = 0.0
@@ -110,6 +129,7 @@ def train_one_epoch(model, loader, optim, device, use_bf16=False):
             loss = loss_func(logits, y)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optim.step()
 
         total_loss += loss.item()
