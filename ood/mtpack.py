@@ -2,14 +2,9 @@ import argparse
 from pathlib import Path
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
 import pandas as pd
 import numpy as np
-from torch.optim import AdamW, Muon
-import matplotlib.pyplot as plt
 import time
 import contextlib
 
@@ -200,6 +195,7 @@ class FastLoader:
 def collect_energy(model, loader, temperature, device, use_bf16):
     model.eval()
     energy_scores = []
+    energy_logits = []
 
     # Определяем контекст автокаста
     amp_dtype = torch.bfloat16 if device.type == 'cuda' else torch.float16
@@ -217,13 +213,17 @@ def collect_energy(model, loader, temperature, device, use_bf16):
             scaled_logits = logits / temperature
             energy = -temperature * torch.logsumexp(scaled_logits, dim=1)
             energy_scores.append(energy.cpu())
+            energy_logits.append(logits.cpu())
 
-    return torch.cat(energy_scores).numpy()
+    energy_scores = torch.cat(energy_scores)
+    energy_logits = torch.cat(energy_logits, dim=0)
+
+    return energy_scores.numpy(), energy_logits.numpy()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--data-dir', type=str, default='/Volumes/HP/proj/mnist_data/data')
@@ -273,8 +273,16 @@ def main():
 
     # 2. Собираем значения энергии для ID (7) и OOD (1)
     T = args.temperature
-    energy_id = collect_energy(model, loader_id_7, T, device, use_bf16)
-    energy_ood = collect_energy(model, loader_ood_1, T, device, use_bf16)
+    energy_id, logits_id = collect_energy(model, loader_id_7, T,  device, use_bf16)
+    energy_ood, logits_ood = collect_energy(model, loader_ood_1, T, device, use_bf16)
+
+    # Сохраняем логиты для анализа
+    logit_path = out_dir / 'logits.csv'
+    df = pd.DataFrame(np.concatenate([logits_id, logits_ood], axis=0))  # Создает 10 колонок для логитов (0-9)
+    df.insert(0, "energy", np.concatenate([energy_id, energy_ood]))
+    df.insert(0, "is_ood", np.concatenate([np.zeros(len(energy_id)), np.ones(len(energy_ood))]))
+    df.columns = ['OOD', 'F'] + [f'{i}' for i in range(logits_id.shape[1])]
+    df.to_csv(logit_path, index=False)
 
     # 3. Построение и сохранение графиков
     import matplotlib.pyplot as plt
