@@ -53,7 +53,7 @@ class Derf(nn.Module):
         # Последняя размерность — каналы (dim)
         self.alpha = nn.Parameter(torch.ones(1, 1, dim) * 0.4)
         self.beta = nn.Parameter(torch.ones(1, 1, dim))
-        self.s = nn.Parameter(torch.ones(1, 1, dim))
+        self.s = nn.Parameter(torch.zeros(1, 1, dim))
 
     def forward(self, x):
         return self.alpha * torch.erf(self.beta * x + self.s)
