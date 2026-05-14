@@ -148,7 +148,7 @@ def pick_best_person(result):
 
 
 def main():
-    model = YOLO("yolo26n-pose.pt")
+    model = YOLO("../yolo26n-pose.pt")
 
     preferred_device = "mps"   # для Mac mini M4
     inference_device = preferred_device
